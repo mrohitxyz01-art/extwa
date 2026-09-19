@@ -1,25 +1,4 @@
-DK Sharma Bot v3 — Runtime Dependencies
-
-Install with: pip install -r requirements.txt
-
-Telegram Bot API
-
 pyTelegramBotAPI>=4.14.0
-
-HTTP requests, redirects and proxy fetching
-
 requests>=2.31.0
-
-SOCKS4/SOCKS5 proxy support
-
 PySocks>=1.7.1
-
-Optional: AES support for the ByetHost challenge.
-
-The bot can run without this package using its fallback implementation.
-
 pycryptodome>=3.19.0
-
-curl_cffi is not required.
-
-The v3 engine uses requests and does not use Playwright/Selenium.
