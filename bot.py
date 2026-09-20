@@ -106,7 +106,7 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 3600.0) -
     return max(lo, min(hi, v))
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAEO4eCM9mobB95N1LXsWAeTAKSdcVaqI2Y").strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "FATAL: BOT_TOKEN environment variable is not set.\n"
@@ -160,11 +160,83 @@ PROXY_SOURCES_ENV = [
 # Built-in public proxy lists — used automatically when the admin has not
 # configured any PROXY_SOURCE_* URLs, so "Fetch Latest" works out of the box.
 BUILTIN_PROXY_SOURCES = [
+    # TheSpeedX — large, frequently updated
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
+    # proxifly
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt",
+    # jetkai
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt",
+    # clarketm
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    # sunny9577
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+    # monosans
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    # roosterkid
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+    # MuRongPIG
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt",
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks4.txt",
+    # ObcbO
+    "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/http.txt",
+    "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/socks5.txt",
+    # hookzof
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    # ShiftyTR
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt",
+    # mmpx12
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/https.txt",
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt",
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
+    # Anonym0usWork1221
+    "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt",
+    "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks5_proxies.txt",
+    "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks4_proxies.txt",
+    # r00tee
+    "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt",
+    "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks4.txt",
+    "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
+    # elliottophellia
+    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
+    "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks5/global/socks5_checked.txt",
+    # dpangestuw
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/http_proxies.txt",
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/socks5_proxies.txt",
+    # ALIILAPRO
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+    # vakhov
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
+    # Zaeem20
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
+    # prxchk
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
+    # zloi-user
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
+    # almroot
+    "https://raw.githubusercontent.com/almroot/proxylist/master/list.txt",
+    # aslisk
+    "https://raw.githubusercontent.com/aslisk/proxyhttps/main/https.txt",
 ]
 
 BOOTSTRAP_OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
@@ -425,6 +497,7 @@ _DEFAULT_SETTINGS = {
     "max_retries_per_visit": str(MAX_RETRIES_PER_VISIT),
     "ip_turbo_concurrency": str(IP_TURBO_CONCURRENCY),
     "ip_max_proxy_attempts": str(IP_MAX_PROXY_ATTEMPTS),
+    "fallback_direct_on_empty_pool": "0",
     "channel_include_username": "1",
     "channel_include_uid": "0",
     "channel_include_method": "1",
@@ -1321,25 +1394,30 @@ def get_proxy_row(proxy_id: int) -> Optional[dict]:
             conn.close()
 
 
-def list_proxies(limit: int = 100, status_filter: Optional[str] = None,
+def list_proxies(limit: Optional[int] = 100, status_filter: Optional[str] = None,
                  statuses: Optional[tuple] = None) -> list:
+    """List proxies. limit=None means NO cap — return every matching row."""
+    limit_sql = " LIMIT ?" if limit is not None else ""
     with _db_lock:
         conn = get_conn()
         try:
             if statuses:
                 ph = ",".join("?" * len(statuses))
+                params = tuple(statuses) + ((limit,) if limit is not None else ())
                 rows = conn.execute(
-                    f"SELECT * FROM proxies WHERE health_status IN ({ph}) ORDER BY id LIMIT ?",
-                    (*statuses, limit),
+                    f"SELECT * FROM proxies WHERE health_status IN ({ph}) ORDER BY id{limit_sql}",
+                    params,
                 ).fetchall()
             elif status_filter:
+                params = (status_filter,) + ((limit,) if limit is not None else ())
                 rows = conn.execute(
-                    "SELECT * FROM proxies WHERE health_status=? ORDER BY id LIMIT ?",
-                    (status_filter, limit),
+                    f"SELECT * FROM proxies WHERE health_status=? ORDER BY id{limit_sql}",
+                    params,
                 ).fetchall()
             else:
+                params = (limit,) if limit is not None else ()
                 rows = conn.execute(
-                    "SELECT * FROM proxies ORDER BY id LIMIT ?", (limit,)
+                    f"SELECT * FROM proxies ORDER BY id{limit_sql}", params
                 ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -1631,12 +1709,12 @@ def _scope_statuses(scope: str) -> Optional[tuple]:
 def bulk_test_proxies(scope: str = "all", progress_cb=None,
                       cancel_event: Optional[threading.Event] = None) -> dict:
     """Test proxies by scope with bounded concurrency. Returns summary dict."""
-    rows = list_proxies(limit=1000, statuses=_scope_statuses(scope))
+    rows = list_proxies(limit=None, statuses=_scope_statuses(scope))
     if scope == "unhealthy":
         # also include healthy-but-stale proxies
         stale_cutoff = (datetime.utcnow() - timedelta(seconds=PROXY_RETEST_INTERVAL * 2)).isoformat(
             sep=" ", timespec="seconds")
-        rows += [r for r in list_proxies(limit=500, statuses=HEALTHY_STATUSES)
+        rows += [r for r in list_proxies(limit=None, statuses=HEALTHY_STATUSES)
                  if (r["last_tested"] or "") < stale_cutoff]
     if scope == "all":
         rows = [r for r in rows if r["health_status"] != "WORKING" or True]
@@ -1697,6 +1775,40 @@ def bulk_test_proxies(scope: str = "all", progress_cb=None,
                 except Exception:
                     pass
     return summary
+
+
+def _auto_test_bulk_inserted(chat_id, admin_id, expected_count):
+    """Test only freshly-inserted (UNTESTED status) proxies after a bulk add/fetch."""
+    rows = list_proxies(limit=max(expected_count * 2, 50), statuses=("UNTESTED",))
+    # newest first
+    rows_sorted = sorted(rows, key=lambda r: r["id"], reverse=True)[:expected_count]
+    if not rows_sorted:
+        return
+    results = []
+    with ThreadPoolExecutor(max_workers=PROXY_TEST_CONCURRENCY) as ex:
+        futs = {ex.submit(test_proxy, {
+            "protocol": r["protocol"], "host": r["host"], "port": r["port"],
+            "username": r["username"], "password": r["password"],
+            "endpoint": r["endpoint"]
+        }): r["id"] for r in rows_sorted}
+        for fut in as_completed(futs):
+            pid = futs[fut]
+            try:
+                res = fut.result()
+            except Exception:
+                res = {"status": "INVALID", "latency_ms": 0, "exit_ip": "",
+                       "error": "test exception"}
+            update_proxy_health(pid, res)
+            results.append((pid, res))
+    working = sum(1 for _, r in results
+                  if r["status"] in ("FAST", "WORKING", "CONNECTED", "SLOW", "VERY_SLOW"))
+    safe_send_message(
+        chat_id,
+        (f"🧪 *AUTO-TEST COMPLETE*\n"
+         f"━━━━━━━━━━━━━━━━━━━━\n"
+         f"Tested: `{len(results)}`\n"
+         f"Working: `{working}`\n"
+         f"Dead: `{len(results) - working}`"))
 
 
 # =========================================================
@@ -2574,7 +2686,27 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
 
         if mode == "IP_ROTATION":
             proxies = proxy_pool.select(count=1)
-            if not proxies:
+            _direct_fallback = False
+            if not proxies and get_setting("fallback_direct_on_empty_pool", "0") == "1":
+                # Pool exhausted — attempt this visit direct (no proxy) so
+                # coverage continues even with an empty/thin proxy pool.
+                _emit(st, "Proxy pool empty — falling back to direct…")
+                _direct_fallback = True
+                t0 = time.time()
+                try:
+                    scraper = Scraper(proxy=None)
+                    final_url, body, visited, status_code = scraper.fetch(
+                        url, cancel_event=cancel_event)
+                    attempt_latency = int((time.time() - t0) * 1000)
+                    attempt_status = "OK_DIRECT"
+                    ok = True
+                except JobCancelled:
+                    return
+                except Exception as e:
+                    attempt_err = str(e)[:120]
+                    attempt_status = _classify_err(e)
+                    attempt_latency = int((time.time() - t0) * 1000)
+            if not proxies and not _direct_fallback:
                 with st["lock"]:
                     st["visit"] += 1
                     st["failed"] += 1
@@ -2582,79 +2714,80 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                 pending_attempts.append((job_id, visit, None, "", "NO_PROXY", 0,
                                          "no verified proxy available"))
                 return
-            proxy_row = proxies[0]
-            proxy_dict = {k: proxy_row[k] for k in
-                          ("protocol", "host", "port", "username", "password", "endpoint")}
-            attempt_proxy_id = proxy_row["id"]
-            # Always use cached IP — NEVER make an extra IP-check request per visit
-            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
-            _emit(st, "Fetching via proxy…",
-                  proxy_protocol=proxy_row["protocol"].upper(),
-                  exit_ip=attempt_exit_ip)
+            if not _direct_fallback:
+                proxy_row = proxies[0]
+                proxy_dict = {k: proxy_row[k] for k in
+                              ("protocol", "host", "port", "username", "password", "endpoint")}
+                attempt_proxy_id = proxy_row["id"]
+                # Always use cached IP — NEVER make an extra IP-check request per visit
+                attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
+                _emit(st, "Fetching via proxy…",
+                      proxy_protocol=proxy_row["protocol"].upper(),
+                      exit_ip=attempt_exit_ip)
 
-            # TURBO: keep rotating through fresh proxies until one works.
-            # Each failed proxy is auto-marked and never retried in this visit.
-            max_attempts = max(3, int(get_setting("ip_max_proxy_attempts",
-                                                  str(IP_MAX_PROXY_ATTEMPTS))))
-            tried_ids = set()
-            last_status = "REQUEST_FAILED"
-            for attempt in range(max_attempts):
-                if cancel_event.is_set():
-                    proxy_pool.release(proxy_row["id"])
-                    return
-                t0 = time.time()
-                try:
-                    scraper = Scraper(proxy=proxy_dict)
-                    final_url, body, visited, status_code = scraper.fetch(
-                        url, cancel_event=cancel_event)
-                    attempt_latency = int((time.time() - t0) * 1000)
-                    # Use cached IP — zero extra network calls per visit
-                    attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
-                    ok = True
-                    break
-                except JobCancelled:
-                    proxy_pool.release(proxy_row["id"])
-                    return
-                except Exception as e:
-                    attempt_latency = int((time.time() - t0) * 1000)
-                    attempt_err = str(e)[:120]
-                    last_status = _classify_err(e)
-                    status_code = 0
-                    # proxy-layer failure → mark proxy; target failure → keep proxy
-                    if _is_proxy_error(last_status):
-                        proxy_pool.mark_used_failure(
-                            proxy_row["id"],
-                            "AUTH_FAILED" if last_status == "AUTH_FAILED" else "TCP_FAILED",
-                            attempt_err)
-                    else:
-                        update_proxy_health(proxy_row["id"],
-                                            {"status": "TARGET_FAILED", "latency_ms": 0,
-                                             "exit_ip": "", "error": attempt_err})
+                # TURBO: keep rotating through fresh proxies until one works.
+                # Each failed proxy is auto-marked and never retried in this visit.
+                max_attempts = max(3, int(get_setting("ip_max_proxy_attempts",
+                                                      str(IP_MAX_PROXY_ATTEMPTS))))
+                tried_ids = set()
+                last_status = "REQUEST_FAILED"
+                for attempt in range(max_attempts):
+                    if cancel_event.is_set():
                         proxy_pool.release(proxy_row["id"])
-                    tried_ids.add(proxy_row["id"])
-                    # permanent target-level failures are not retried
-                    if last_status == "DNS_FAILED":
+                        return
+                    t0 = time.time()
+                    try:
+                        scraper = Scraper(proxy=proxy_dict)
+                        final_url, body, visited, status_code = scraper.fetch(
+                            url, cancel_event=cancel_event)
+                        attempt_latency = int((time.time() - t0) * 1000)
+                        # Use cached IP — zero extra network calls per visit
+                        attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
+                        ok = True
                         break
-                    # retry with a DIFFERENT fresh proxy — always, not just "safely"
-                    if attempt < max_attempts - 1:
-                        nxt = proxy_pool.select(count=1, exclude=tried_ids)
-                        if nxt:
-                            proxy_row = nxt[0]
-                            proxy_dict = {k: proxy_row[k] for k in
-                                          ("protocol", "host", "port", "username",
-                                           "password", "endpoint")}
-                            attempt_proxy_id = proxy_row["id"]
-                            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
-                            _emit(st, "Rotating to fresh proxy…")
-                            continue
-                    break
-            if ok:
-                attempt_status = "OK" if attempt == 0 else "OK_RETRY"
-                # Mark success WITHOUT verifying exit IP (no network call = fast)
-                proxy_pool.mark_used_success(proxy_row["id"], attempt_latency,
-                                             attempt_exit_ip)
-            else:
-                attempt_status = last_status
+                    except JobCancelled:
+                        proxy_pool.release(proxy_row["id"])
+                        return
+                    except Exception as e:
+                        attempt_latency = int((time.time() - t0) * 1000)
+                        attempt_err = str(e)[:120]
+                        last_status = _classify_err(e)
+                        status_code = 0
+                        # proxy-layer failure → mark proxy; target failure → keep proxy
+                        if _is_proxy_error(last_status):
+                            proxy_pool.mark_used_failure(
+                                proxy_row["id"],
+                                "AUTH_FAILED" if last_status == "AUTH_FAILED" else "TCP_FAILED",
+                                attempt_err)
+                        else:
+                            update_proxy_health(proxy_row["id"],
+                                                {"status": "TARGET_FAILED", "latency_ms": 0,
+                                                 "exit_ip": "", "error": attempt_err})
+                            proxy_pool.release(proxy_row["id"])
+                        tried_ids.add(proxy_row["id"])
+                        # permanent target-level failures are not retried
+                        if last_status == "DNS_FAILED":
+                            break
+                        # retry with a DIFFERENT fresh proxy — always, not just "safely"
+                        if attempt < max_attempts - 1:
+                            nxt = proxy_pool.select(count=1, exclude=tried_ids)
+                            if nxt:
+                                proxy_row = nxt[0]
+                                proxy_dict = {k: proxy_row[k] for k in
+                                              ("protocol", "host", "port", "username",
+                                               "password", "endpoint")}
+                                attempt_proxy_id = proxy_row["id"]
+                                attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
+                                _emit(st, "Rotating to fresh proxy…")
+                                continue
+                        break
+                if ok:
+                    attempt_status = "OK" if attempt == 0 else "OK_RETRY"
+                    # Mark success WITHOUT verifying exit IP (no network call = fast)
+                    proxy_pool.mark_used_success(proxy_row["id"], attempt_latency,
+                                                 attempt_exit_ip)
+                else:
+                    attempt_status = last_status
         else:
             _emit(st, "Fetching…")
             t0 = time.time()
@@ -3008,11 +3141,28 @@ def _fmt_duration(ms: int) -> str:
     return f"{m:02d}:{sec:02d}"
 
 
+def _display_number(n: str) -> str:
+    """
+    Convert stored normalized number back to E.164 display format.
+
+    Storage format:
+      - Indian mobile (10 digits, starts with 6-9): stored as 10 digits, e.g. "9158857078"
+      - All other numbers: stored with country code digits, e.g. "60054933367"
+
+    Indian detection: exactly 10 digits AND first digit is 6, 7, 8, or 9.
+    These must have +91 prepended for correct E.164 display.
+    All other numbers just get a + prefix.
+    """
+    if n and len(n) == 10 and n[0] in "6789":
+        return f"+91{n}"
+    return f"+{n}"
+
+
 def _copy_chunks(numbers: list, limit: int = 250) -> list:
     """Split numbers into chunks that each fit Telegram's 256-char copy limit."""
     chunks, cur = [], ""
     for n in numbers:
-        line = f"+{n}\n"
+        line = f"{_display_number(n)}\n"
         if len(cur) + len(line) > limit:
             if cur:
                 chunks.append(cur.strip())
@@ -3078,7 +3228,7 @@ def _numbers_txt_content(job_id, username, user_id, url, mode, count,
     ]
     for n in sorted(found.keys()):
         m, src, v = found[n]
-        lines_out.append(f"+{n} | {m} | {src} | #{v}")
+        lines_out.append(f"{_display_number(n)} | {m} | {src} | #{v}")
     return "\n".join(lines_out)
 
 
@@ -3109,7 +3259,7 @@ def _send_final_result(chat_id, user_id, username, job_id, url, mode, count,
     if unique > 0:
         rows.append(f"║  📞 {unique} Result(s) Found")
         for n in phones[:8]:
-            rows.append(f"║  +{n}")
+            rows.append(f"║  {_display_number(n)}")
         for uname in tg_users[:3]:
             rows.append(f"║  📱 @{uname}")
         if len(phones) > 8:
@@ -3164,7 +3314,7 @@ def _send_final_result(chat_id, user_id, username, job_id, url, mode, count,
                               reply_markup=copy_mk)
         # inline number display (chunked, message-limit safe)
         if unique <= 60:
-            lines = [f"+{n}" for n in phones] + [f"📱 @{u}" for u in tg_users]
+            lines = [_display_number(n) for n in phones] + [f"📱 @{u}" for u in tg_users]
             chunks, cur = [], ""
             for ln in lines:
                 if len(cur) + len(ln) + 1 > 3800:
@@ -3294,7 +3444,7 @@ def _channel_post(job_id, user_id, username, url, mode, count, success,
             lines.append("📞 Numbers")
             lines.append("")
             for n in sorted_nums:
-                lines.append(f"+{n}")
+                lines.append(f"{_display_number(n)}")
         else:
             lines.append(f"📞 Numbers Found: `{unique}`")
             lines.append("Use the Copy buttons below or the attached file.")
@@ -5003,6 +5153,12 @@ def _handle_proxy_bulk(chat_id, admin_id, text):
     audit_log(admin_id, "PROXY_BULK_ADD",
               f"inserted={stats['inserted']} dupes={stats['duplicates']}")
     clear_user_state(admin_id)
+    if stats["inserted"] > 0:
+        threading.Thread(
+            target=_auto_test_bulk_inserted,
+            args=(chat_id, admin_id, stats["inserted"]),
+            daemon=True,
+        ).start()
     safe_send_message(
         chat_id,
         (f"📦 *BULK ADD COMPLETE*\n"
@@ -5011,7 +5167,8 @@ def _handle_proxy_bulk(chat_id, admin_id, text):
          f"Invalid: `{stats['invalid']}`\n"
          f"Duplicates: `{stats['duplicates']}`\n"
          f"Inserted: `{stats['inserted']}`\n\n"
-         f"Run *Test All* to verify them."),
+         + (f"🧪 Auto-testing the `{stats['inserted']}` new proxies now…"
+            if stats["inserted"] > 0 else "No new proxies to test.")),
         reply_markup=proxy_center_keyboard())
 
 
@@ -5204,6 +5361,12 @@ def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev):
     if not test_after or cancel_ev.is_set():
         log_proxy_fetch(sources[0] if sources else "?", summary)
         proxy_fetch_jobs.pop(admin_id, None)
+        if stats["inserted"] > 0 and not cancel_ev.is_set():
+            threading.Thread(
+                target=_auto_test_bulk_inserted,
+                args=(chat_id, admin_id, stats["inserted"]),
+                daemon=True,
+            ).start()
         safe_edit_message(
             chat_id, msg.message_id,
             (f"✅ *PROXY FETCH COMPLETE*\n"
@@ -5214,7 +5377,8 @@ def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev):
              f"Invalid: `{stats['invalid']}`\n"
              f"New stored: `{stats['inserted']}`\n"
              + (f"Source errors: `{errors}`\n" if errors else "")
-             + "\n_Run Test All to verify them._"))
+             + ("\n🧪 _Auto-testing the new batch now…_" if stats["inserted"] > 0
+                else "\n_Run Test All to verify them._")))
         safe_send_message(chat_id, "🌐 *Proxy Center*",
                           reply_markup=proxy_center_keyboard())
         log.info("PROXY_FETCH_COMPLETE fetched=%s inserted=%s",
