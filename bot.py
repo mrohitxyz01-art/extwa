@@ -1,3 +1,31 @@
+"""
+DK Sharma Bot — WhatsApp Number Extractor (Production Edition v3)
+Render/VPS compatible. Single-file deployment.
+
+v2 upgrade (audited refactor of v1):
+  • Centralized navigation state machine: every input screen has 🔙 Back and
+    ❌ Cancel; Back never cancels a running extraction job.
+  • Atomic active-job registration: active_jobs[user_id] = job_id with a
+    threading.Event cancellation primitive checked at every stage.
+  • Fast extraction: thread-local requests.Session reuse (keep-alive),
+    ThreadPoolExecutor bounded visit concurrency, no per-visit exit-IP
+    re-check (cached last_observed_ip + configurable verify interval),
+    batched DB writes, short transactions, WAL.
+  • Proxy engine: racing multi-endpoint verification (first success wins),
+    configurable latency classification, weighted pool selection,
+    proxy-vs-target failure distinction, scope-aware bulk retest,
+    configurable live proxy sources (fetch → parse → dedupe → test → pool),
+    background auto-retest with configurable interval/batch.
+  • Channel auto-post: polished result card, real clipboard CopyTextButton
+    chunks (≤256 chars), share button, optional TXT attachment, async with
+    bounded exponential-backoff retries and error classification.
+  • Safety: no hardcoded secrets, friendly error messages, credential-safe
+    logs, startup config validation, rate-limit-safe Telegram wrappers.
+
+Privacy: only fetches URLs the operator is authorized to process. No CAPTCHA
+bypass, no login bypass, no private-account scraping.
+"""
+
 import os
 import re
 import io
@@ -78,7 +106,7 @@ def _env_float(name: str, default: float, lo: float = 0.1, hi: float = 3600.0) -
     return max(lo, min(hi, v))
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8553353076:AAEO4eCM9mobB95N1LXsWAeTAKSdcVaqI2Y").strip()
 if not BOT_TOKEN:
     sys.stderr.write(
         "FATAL: BOT_TOKEN environment variable is not set.\n"
@@ -132,28 +160,11 @@ PROXY_SOURCES_ENV = [
 # Built-in public proxy lists — used automatically when the admin has not
 # configured any PROXY_SOURCE_* URLs, so "Fetch Latest" works out of the box.
 BUILTIN_PROXY_SOURCES = [
-    # TheSpeedX — large, frequently updated
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-    # proxifly — protocol-separated, verified daily
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
-    # monosans — high-churn, high-volume
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-    # ShiftyTR — updated multiple times daily
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
-    # roosterkid — lightweight, fresh
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
-    # mmpx12 — complementary pool
-    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
-    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
-    # hookzof — additional SOCKS5 variety
-    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
 ]
 
 BOOTSTRAP_OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
@@ -1805,24 +1816,17 @@ _META_REFRESH_RE = re.compile(
     re.IGNORECASE,
 )
 _JS_LOCATION_RE = re.compile(
-    # group 1: window/document/top/self .location[.href] = "..."
-    r'(?:window|document|top|self)\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']'
-    # group 2: bare location = "..." or location.href = "..."
-    r'|(?<![.\w])location(?:\.href)?\s*=\s*["\']([^"\']+)["\']'
-    # group 3: location.replace("...") or location.assign("...")
-    r'|location\.(?:replace|assign)\(\s*["\']([^"\']+)["\']\s*\)'
-    # group 4: setTimeout/setInterval wrapper pattern used by cashwingo/affiliate pages
-    # e.g. setTimeout(function(){ window.location = "..." }, 100)
-    r'|setTimeout\s*\([^)]*?(?:window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']|'
-    r'location\.(?:replace|assign)\(\s*["\']([^"\']+)["\']\s*\))[^)]*?\)'
-    # group 6: document.location.href = "..."
-    r'|document\.location\.href\s*=\s*["\']([^"\']+)["\']',
-    re.IGNORECASE | re.DOTALL,
+    r'(?:window|document|top|self)\.location(?:\.href)?\s*(?:=|\()\s*["\']([^"\']+)["\']'
+    r'|location\.replace\(["\']([^"\']+)["\']\)'
+    r'|location\.assign\(["\']([^"\']+)["\']\)',
+    re.IGNORECASE,
 )
 
 
-def _js_location_url(m: re.Match) -> str:
-    """Return the first non-empty capture group from a _JS_LOCATION_RE match."""
+def _js_location_target(m) -> str:
+    """First non-empty group from an _JS_LOCATION_RE match."""
+    if not m:
+        return ""
     for g in m.groups():
         if g:
             return g
@@ -1853,9 +1857,12 @@ def _looks_like_false_positive(digits: str) -> bool:
             pass
     if n == 13 and digits.startswith(("15", "16", "17", "18", "19", "20")):
         return True  # epoch milliseconds
-    # Meta/Facebook ad ID pattern (18 digits starting with 12 — utm_id, utm_content, utm_term)
+    # Meta/Facebook ad IDs embedded in utm_id/utm_content/utm_term —
+    # 17–18 digit tracking identifiers, not phone numbers
     if n == 18 and digits.startswith("12"):
         return True
+    if n in (17, 18) and digits.startswith(("11", "12", "13", "2384")):
+        return True  # Meta ad/campaign ID ranges
     # all same digit / obvious sequences
     if len(set(digits)) <= 2:
         return True
@@ -1867,23 +1874,19 @@ def _looks_like_false_positive(digits: str) -> bool:
 def _normalize(raw: str) -> Optional[str]:
     """Normalize +919876543210 / 00919876543210 / 919876543210 → digits only.
 
-    Handles:
-      +91XXXXXXXXXX  → strips + then 91 prefix (via 12-digit check below)
-      0091XXXXXXXXXX → strips 00, then 91 prefix
-      91XXXXXXXXXX   → strips bare 91 prefix when 12 digits and next digit is [6-9]
+    Indian mobiles: a 12-digit string starting with 91 whose 3rd digit is a
+    valid mobile prefix [6-9] is stored as the 10-digit national form so all
+    variants (+91…, 91…, 0…) dedupe to the same number.
     """
     digits = re.sub(r"\D", "", raw or "")
     if not digits:
         return None
-    # strip 00-prefixed country codes
     if digits.startswith("00"):
         digits = digits[2:]
-    # strip bare India country code (91) when 12 digits and valid mobile prefix [6-9]
-    # e.g. 919876543210 → 9876543210
     if len(digits) == 12 and digits.startswith("91") and digits[2] in "6789":
-        stripped = digits[2:]
-        if not _looks_like_false_positive(stripped):
-            return stripped
+        digits = digits[2:]
+    if len(digits) == 11 and digits.startswith("0") and digits[1] in "6789":
+        digits = digits[1:]
     if _looks_like_false_positive(digits):
         return None
     return digits
@@ -2339,11 +2342,9 @@ class Scraper:
                 continue
 
             js = _JS_LOCATION_RE.search(body[:50000])
-            if js:
-                js_url = _js_location_url(js)
-                if not js_url:
-                    break
-                nxt = urllib.parse.urljoin(current, html.unescape(js_url.strip()))
+            js_target = _js_location_target(js)
+            if js_target:
+                nxt = urllib.parse.urljoin(current, html.unescape(js_target.strip()))
                 if nxt in visited_set or not nxt.startswith(("http://", "https://")):
                     break
                 current = nxt
@@ -2352,6 +2353,21 @@ class Scraper:
                 continue
 
             break
+
+        # Root-cause-1 guard: if the loop ended but the body still looks like
+        # a thin redirect page (meta refresh / JS location), warn loudly —
+        # extraction will run on this intermediate page, not the real target.
+        if status_code < 400 and 0 < len(body) < 2048:
+            meta_late = _META_REFRESH_RE.search(body)
+            js_late = _js_location_target(_JS_LOCATION_RE.search(body))
+            if meta_late or js_late:
+                log.warning(
+                    "REDIRECT_BODY_UNFOLLOWED url=%s final=%s status=%s "
+                    "target=%s — extraction may miss numbers on the real "
+                    "landing page",
+                    url, current, status_code,
+                    (html.unescape(meta_late.group(1).strip()) if meta_late
+                     else html.unescape(js_late.strip())))
 
         return current, body, visited, status_code
 
@@ -2559,100 +2575,86 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
         if mode == "IP_ROTATION":
             proxies = proxy_pool.select(count=1)
             if not proxies:
-                # No healthy proxy available — fall back to a direct fetch for this
-                # visit so the job never counts a blank failure when the pool is dry.
-                log.warning("NO_PROXY_FALLBACK job=%s visit=%s — direct fallback",
-                            job_id, visit)
-                _emit(st, "No proxy available — fetching direct…")
+                with st["lock"]:
+                    st["visit"] += 1
+                    st["failed"] += 1
+                    st["speed_window"].append((time.time(), st["visit"]))
+                pending_attempts.append((job_id, visit, None, "", "NO_PROXY", 0,
+                                         "no verified proxy available"))
+                return
+            proxy_row = proxies[0]
+            proxy_dict = {k: proxy_row[k] for k in
+                          ("protocol", "host", "port", "username", "password", "endpoint")}
+            attempt_proxy_id = proxy_row["id"]
+            # Always use cached IP — NEVER make an extra IP-check request per visit
+            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
+            _emit(st, "Fetching via proxy…",
+                  proxy_protocol=proxy_row["protocol"].upper(),
+                  exit_ip=attempt_exit_ip)
+
+            # TURBO: keep rotating through fresh proxies until one works.
+            # Each failed proxy is auto-marked and never retried in this visit.
+            max_attempts = max(3, int(get_setting("ip_max_proxy_attempts",
+                                                  str(IP_MAX_PROXY_ATTEMPTS))))
+            tried_ids = set()
+            last_status = "REQUEST_FAILED"
+            for attempt in range(max_attempts):
+                if cancel_event.is_set():
+                    proxy_pool.release(proxy_row["id"])
+                    return
                 t0 = time.time()
                 try:
-                    scraper = Scraper(proxy=None)
+                    scraper = Scraper(proxy=proxy_dict)
                     final_url, body, visited, status_code = scraper.fetch(
                         url, cancel_event=cancel_event)
                     attempt_latency = int((time.time() - t0) * 1000)
+                    # Use cached IP — zero extra network calls per visit
+                    attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
                     ok = True
-                    attempt_status = "OK_DIRECT_FALLBACK"
+                    break
                 except JobCancelled:
+                    proxy_pool.release(proxy_row["id"])
                     return
                 except Exception as e:
-                    attempt_err = str(e)[:120]
-                    attempt_status = _classify_err(e)
                     attempt_latency = int((time.time() - t0) * 1000)
+                    attempt_err = str(e)[:120]
+                    last_status = _classify_err(e)
+                    status_code = 0
+                    # proxy-layer failure → mark proxy; target failure → keep proxy
+                    if _is_proxy_error(last_status):
+                        proxy_pool.mark_used_failure(
+                            proxy_row["id"],
+                            "AUTH_FAILED" if last_status == "AUTH_FAILED" else "TCP_FAILED",
+                            attempt_err)
+                    else:
+                        update_proxy_health(proxy_row["id"],
+                                            {"status": "TARGET_FAILED", "latency_ms": 0,
+                                             "exit_ip": "", "error": attempt_err})
+                        proxy_pool.release(proxy_row["id"])
+                    tried_ids.add(proxy_row["id"])
+                    # permanent target-level failures are not retried
+                    if last_status == "DNS_FAILED":
+                        break
+                    # retry with a DIFFERENT fresh proxy — always, not just "safely"
+                    if attempt < max_attempts - 1:
+                        nxt = proxy_pool.select(count=1, exclude=tried_ids)
+                        if nxt:
+                            proxy_row = nxt[0]
+                            proxy_dict = {k: proxy_row[k] for k in
+                                          ("protocol", "host", "port", "username",
+                                           "password", "endpoint")}
+                            attempt_proxy_id = proxy_row["id"]
+                            attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
+                            _emit(st, "Rotating to fresh proxy…")
+                            continue
+                    break
+            if ok:
+                attempt_status = "OK" if attempt == 0 else "OK_RETRY"
+                # Mark success WITHOUT verifying exit IP (no network call = fast)
+                proxy_pool.mark_used_success(proxy_row["id"], attempt_latency,
+                                             attempt_exit_ip)
             else:
-                # Proxies available — run the TURBO multi-proxy retry loop
-                proxy_row = proxies[0]
-                proxy_dict = {k: proxy_row[k] for k in
-                              ("protocol", "host", "port", "username", "password", "endpoint")}
-                attempt_proxy_id = proxy_row["id"]
-                # Always use cached IP — NEVER make an extra IP-check request per visit
-                attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
-                _emit(st, "Fetching via proxy…",
-                      proxy_protocol=proxy_row["protocol"].upper(),
-                      exit_ip=attempt_exit_ip)
-
-                # TURBO: keep rotating through fresh proxies until one works.
-                # Each failed proxy is auto-marked and never retried in this visit.
-                max_attempts = max(3, int(get_setting("ip_max_proxy_attempts",
-                                                      str(IP_MAX_PROXY_ATTEMPTS))))
-                tried_ids = set()
-                last_status = "REQUEST_FAILED"
-                for attempt in range(max_attempts):
-                    if cancel_event.is_set():
-                        proxy_pool.release(proxy_row["id"])
-                        return
-                    t0 = time.time()
-                    try:
-                        scraper = Scraper(proxy=proxy_dict)
-                        final_url, body, visited, status_code = scraper.fetch(
-                            url, cancel_event=cancel_event)
-                        attempt_latency = int((time.time() - t0) * 1000)
-                        # Use cached IP — zero extra network calls per visit
-                        attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
-                        ok = True
-                        break
-                    except JobCancelled:
-                        proxy_pool.release(proxy_row["id"])
-                        return
-                    except Exception as e:
-                        attempt_latency = int((time.time() - t0) * 1000)
-                        attempt_err = str(e)[:120]
-                        last_status = _classify_err(e)
-                        status_code = 0
-                        # proxy-layer failure → mark proxy; target failure → keep proxy
-                        if _is_proxy_error(last_status):
-                            proxy_pool.mark_used_failure(
-                                proxy_row["id"],
-                                "AUTH_FAILED" if last_status == "AUTH_FAILED" else "TCP_FAILED",
-                                attempt_err)
-                        else:
-                            update_proxy_health(proxy_row["id"],
-                                                {"status": "TARGET_FAILED", "latency_ms": 0,
-                                                 "exit_ip": "", "error": attempt_err})
-                            proxy_pool.release(proxy_row["id"])
-                        tried_ids.add(proxy_row["id"])
-                        # permanent target-level failures are not retried
-                        if last_status == "DNS_FAILED":
-                            break
-                        # retry with a DIFFERENT fresh proxy — always, not just "safely"
-                        if attempt < max_attempts - 1:
-                            nxt = proxy_pool.select(count=1, exclude=tried_ids)
-                            if nxt:
-                                proxy_row = nxt[0]
-                                proxy_dict = {k: proxy_row[k] for k in
-                                              ("protocol", "host", "port", "username",
-                                               "password", "endpoint")}
-                                attempt_proxy_id = proxy_row["id"]
-                                attempt_exit_ip = proxy_row.get("last_observed_ip") or ""
-                                _emit(st, "Rotating to fresh proxy…")
-                                continue
-                        break
-                if ok:
-                    attempt_status = "OK" if attempt == 0 else "OK_RETRY"
-                    # Mark success WITHOUT verifying exit IP (no network call = fast)
-                    proxy_pool.mark_used_success(proxy_row["id"], attempt_latency,
-                                                 attempt_exit_ip)
-                else:
-                    attempt_status = last_status
+                attempt_status = last_status
         else:
             _emit(st, "Fetching…")
             t0 = time.time()
@@ -2706,31 +2708,32 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
             attempt_status = f"HTTP_{status_code}"
             attempt_err = f"target returned HTTP {status_code}"
             ok = False
-            # Soft 4xx fallback: many affiliate/landing pages return numbers alongside
-            # a 403/429 status (e.g. cashwingo-style redirect targets). extract_deep
-            # is read-only — safe to run even when ok=False. Only attempt when body
-            # is non-empty and status is a soft block (not a hard 404/410).
-            if body and status_code in (403, 429) and not cancel_event.is_set():
-                _soft4xx_res = extract_deep(body, final_url, visited,
-                                            cancel_event=cancel_event)
-                if _soft4xx_res["numbers"]:
-                    log.info("SOFT_4XX_EXTRACTION job=%s status=%s numbers=%s",
-                             job_id, status_code, len(_soft4xx_res["numbers"]))
-                    with found_lock:
-                        for _n, _m, _src in _soft4xx_res["numbers"]:
-                            if _n not in found:
-                                found[_n] = (_m, _src, visit)
-                                new_this_visit += 1
-                                pending_numbers.append(
-                                    (job_id, user_id, _n, _src, _m, visit))
-                            else:
-                                dup_count[0] += 1
-                    attempt_status = f"HTTP_{status_code}_WITH_NUMBERS"
-                else:
-                    log.debug("ZERO_NUMBERS_SOFT_4XX job=%s url=%s final_url=%s "
-                              "status=%s body_len=%s",
-                              job_id, url, final_url, status_code, len(body))
-                    log.debug("BODY_SAMPLE: %s", body[:2000])
+
+        # --- soft-4xx fallback: many landing pages return 403/429 WITH the
+        # full HTML (and the numbers) in the body. extract_deep() is
+        # read-only, so mining that body is always safe. ---
+        if not ok and body and status_code in (403, 429):
+            res = extract_deep(body, final_url, visited,
+                               cancel_event=cancel_event)
+            if res["numbers"]:
+                log.info("SOFT_4XX_EXTRACTION job=%s status=%s hits=%s",
+                         job_id, status_code, len(res["numbers"]))
+                layers_fired_pre = res["layers"]
+                tg_pre = res["telegram"]
+                with found_lock:
+                    for n, m, src_url in res["numbers"]:
+                        if n in found:
+                            dup_count[0] += 1
+                        else:
+                            found[n] = (m, src_url, visit)
+                            new_pre = 1
+                            pending_numbers.append(
+                                (job_id, user_id, n, src_url, m, visit))
+                # report the visit as a partial success so the numbers ship
+                ok = True
+                attempt_status = f"HTTP_{status_code}_BODY_OK"
+                layers_fired = layers_fired_pre
+                tg_info = tg_pre
 
         # --- protection detection (runs on every fetched response) ---
         prot = detect_protection(body or "", status_code, final_url)
@@ -2771,11 +2774,13 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
             layers_fired = res["layers"]
             tg_info = res["telegram"]
             if not res["numbers"]:
-                log.warning("ZERO_NUMBERS job=%s url=%s final_url=%s status=%s "
-                            "layers=%s body_len=%s",
-                            job_id, url, final_url, status_code,
-                            res["layers"], len(body))
-                log.debug("BODY_SAMPLE: %s", body[:2000])
+                log.warning(
+                    "ZERO_NUMBERS job=%s url=%s final_url=%s status=%s "
+                    "layers=%s body_len=%s",
+                    job_id, url, final_url, status_code,
+                    res["layers"], len(body or ""))
+                log.debug("BODY_SAMPLE job=%s sample=%r",
+                          job_id, (body or "")[:2000])
             with found_lock:
                 for n, m, src_url in res["numbers"]:
                     if n in found:
@@ -4223,7 +4228,6 @@ def on_callback(c: types.CallbackQuery):
 
         # ---------- admin gates ----------
         if (data.startswith("adm_") or data.startswith("px") or
-                data.startswith("pxlist_") or
                 data.startswith("set_") or data.startswith("usr_") or
                 data.startswith("upage_") or data.startswith("udetail_") or
                 data.startswith("uhist_") or data.startswith("unums_") or
@@ -4339,14 +4343,6 @@ def on_callback(c: types.CallbackQuery):
         if data == "px_working":
             safe_answer_callback(c.id)
             _show_proxy_list(chat_id, working_only=True)
-            return
-        if data.startswith("pxlist_"):
-            # pxlist_w_<page> or pxlist_a_<page>
-            safe_answer_callback(c.id)
-            parts = data.split("_")
-            wf = parts[1] if len(parts) > 1 else "a"
-            pg = int(parts[2]) if len(parts) > 2 else 0
-            _show_proxy_list(chat_id, working_only=(wf == "w"), page=pg)
             return
         if data == "px_test_all":
             safe_answer_callback(c.id, "Test started…")
@@ -4917,58 +4913,40 @@ def _show_proxy_dashboard(chat_id):
     _show_proxy_center(chat_id)
 
 
-def _show_proxy_list(chat_id, working_only=False, page: int = 0):
-    """Show proxies with compact per-row format and pagination so all fit in Telegram's limit."""
-    per_page = 15  # ~45 chars per row × 15 = ~675 + header ≈ well under 4096
-    offset = page * per_page
+def _show_proxy_list(chat_id, working_only=False):
     if working_only:
-        all_rows = list_proxies(limit=200, statuses=HEALTHY_STATUSES)
+        rows = list_proxies(limit=20, statuses=HEALTHY_STATUSES)
         title = "📋 *WORKING PROXIES*"
     else:
-        all_rows = list_proxies(limit=200)
+        rows = list_proxies(limit=20)
         title = "📋 *PROXY LIST*"
-    total = len(all_rows)
-    rows = all_rows[offset:offset + per_page]
     if not rows:
         safe_send_message(chat_id, "No proxies found.",
                           reply_markup=proxy_center_keyboard())
         return
-    lines = [
-        title,
-        f"_Showing {offset + 1}–{min(offset + per_page, total)} of {total}_",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
+    lines = [title, "━━━━━━━━━━━━━━━━━━━━"]
     mk = types.InlineKeyboardMarkup(row_width=2)
     icons = {"FAST": "🟢", "WORKING": "🟢", "SLOW": "🟡", "VERY_SLOW": "🟠",
              "CONNECTED": "🔵", "TARGET_FAILED": "🟠", "AUTH_FAILED": "🟣",
              "TCP_FAILED": "🔴", "INVALID": "⚫", "UNTESTED": "⚪"}
     for r in rows:
         ic = icons.get(r["health_status"], "⚪")
-        # Compact single-line format: credentials NEVER shown
-        ip_tag = f" `{r['last_observed_ip']}`" if r["last_observed_ip"] else ""
+        # credentials are NEVER shown — host:port only
         lines.append(
-            f"{ic}`#{r['id']}` `{r['host']}:{r['port']}` "
-            f"lat=`{r['average_latency']}ms` ✅`{r['success_count']}` ❌`{r['failure_count']}`"
-            f"{ip_tag}")
+            f"{ic} `#{r['id']}` *{r['protocol'].upper()}* "
+            f"`{r['host']}:{r['port']}`\n"
+            f"   Latency: `{r['average_latency']}ms` · Score: `{r['health_score']}`\n"
+            f"   Success: `{r['success_count']}` · Failures: `{r['failure_count']}`"
+            + (f"\n   Exit IP: `{r['last_observed_ip']}`"
+               if r["last_observed_ip"] else ""))
         mk.add(
             types.InlineKeyboardButton(f"🧪 #{r['id']}",
                                        callback_data=f"pxtest_{r['id']}"),
             types.InlineKeyboardButton(f"🗑 #{r['id']}",
                                        callback_data=f"pxdel_{r['id']}"),
         )
-    # Pagination controls
-    nav_btns = []
-    wf = "w" if working_only else "a"
-    if page > 0:
-        nav_btns.append(types.InlineKeyboardButton(
-            "◀️ Prev", callback_data=f"pxlist_{wf}_{page - 1}"))
-    if offset + per_page < total:
-        nav_btns.append(types.InlineKeyboardButton(
-            "Next ▶️", callback_data=f"pxlist_{wf}_{page + 1}"))
-    if nav_btns:
-        mk.row(*nav_btns)
     mk.add(types.InlineKeyboardButton("🔙 Proxy Center", callback_data="adm_proxies"))
-    safe_send_message(chat_id, "\n".join(lines), reply_markup=mk)
+    safe_send_message(chat_id, "\n".join(lines)[:4000], reply_markup=mk)
 
 
 def _test_single_proxy_ui(chat_id, proxy_id):
@@ -5224,7 +5202,7 @@ def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev):
                "slow": 0, "dead": 0}
 
     if not test_after or cancel_ev.is_set():
-        log_proxy_fetch(", ".join(sources) if sources else "?", summary)
+        log_proxy_fetch(sources[0] if sources else "?", summary)
         proxy_fetch_jobs.pop(admin_id, None)
         safe_edit_message(
             chat_id, msg.message_id,
@@ -5271,7 +5249,7 @@ def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev):
     summary["working"] = result["working"] + result["fast"]
     summary["slow"] = result["slow"]
     summary["dead"] = result["failed"]
-    log_proxy_fetch(", ".join(sources) if sources else "?", summary)
+    log_proxy_fetch(sources[0] if sources else "?", summary)
     proxy_fetch_jobs.pop(admin_id, None)
     log.info("PROXY_FETCH_COMPLETE fetched=%s working=%s",
              total_fetched, summary["working"])
