@@ -468,6 +468,7 @@ def init_db() -> None:
                 ("proxies", "source", "TEXT DEFAULT 'manual'"),
                 ("proxies", "last_ip_verified", "TIMESTAMP"),
                 ("proxies", "last_used", "TIMESTAMP"),
+                ("proxies", "is_precious", "INTEGER DEFAULT 0"),
             ]
             for tbl, col, decl in migrations:
                 if not _col_exists(conn, tbl, col):
@@ -543,13 +544,19 @@ def get_setting(key: str, default: Optional[str] = None) -> str:
 
 
 def get_settings_batch(keys) -> dict:
+    """One IN query for all keys instead of N separate queries."""
+    if not keys:
+        return {}
     with _db_lock:
         conn = get_conn()
         try:
-            out = {}
-            for k in keys:
-                r = conn.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
-                out[k] = r["value"] if r else _DEFAULT_SETTINGS.get(k, "")
+            ph = ",".join("?" * len(keys))
+            rows = conn.execute(
+                f"SELECT key, value FROM settings WHERE key IN ({ph})", list(keys)
+            ).fetchall()
+            out = {k: _DEFAULT_SETTINGS.get(k, "") for k in keys}
+            for r in rows:
+                out[r["key"]] = r["value"]
             return out
         finally:
             conn.close()
@@ -1199,9 +1206,13 @@ def proxy_label(p: dict) -> str:
 # =========================================================
 IP_CHECK_ENDPOINTS = [
     "https://api.ipify.org?format=text",
-    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
     "https://checkip.amazonaws.com",
     "https://ipinfo.io/ip",
+    "https://ifconfig.me/ip",
+    "https://api.my-ip.io/ip",
+    "https://ipecho.net/plain",
+    "http://ip-api.com/line/?fields=query",
 ]
 
 _TEST_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1226,7 +1237,11 @@ def _verify_exit_ip(p: dict, timeout: float) -> tuple:
     """
     proxies = proxy_to_requests(p)
     result = {}
+    result_lock = threading.Lock()
     auth_failed = threading.Event()
+    # Shuffle before racing so load is spread across all endpoints
+    endpoints_to_try = random.sample(IP_CHECK_ENDPOINTS,
+                                     min(4, len(IP_CHECK_ENDPOINTS)))
 
     def _hit(ep):
         if auth_failed.is_set():
@@ -1238,16 +1253,18 @@ def _verify_exit_ip(p: dict, timeout: float) -> tuple:
             latency = int((time.time() - t0) * 1000)
             if r.status_code == 200:
                 ip = r.text.strip()
-                if _IP_RE.match(ip) and "ip" not in result:
-                    result["ip"] = ip
-                    result["latency"] = latency
+                if _IP_RE.match(ip):
+                    with result_lock:
+                        if "ip" not in result:
+                            result["ip"] = ip
+                            result["latency"] = latency
         except requests.exceptions.ProxyAuthenticationRequired:
             auth_failed.set()
         except Exception:
             pass
 
     threads = [threading.Thread(target=_hit, args=(ep,), daemon=True)
-               for ep in IP_CHECK_ENDPOINTS[:3]]
+               for ep in endpoints_to_try]
     for t in threads:
         t.start()
     deadline = time.time() + timeout + 1
@@ -1326,10 +1343,12 @@ def add_proxy_db(endpoint: str, source: str = "manual") -> Optional[int]:
             if existing:
                 return existing["id"]
             cur = conn.execute(
-                """INSERT INTO proxies(endpoint, protocol, host, port, username, password, source)
-                   VALUES(?,?,?,?,?,?,?)""",
+                """INSERT INTO proxies(endpoint, protocol, host, port, username,
+                                      password, source, is_precious)
+                   VALUES(?,?,?,?,?,?,?,?)""",
                 (p["endpoint"], p["protocol"], p["host"], p["port"],
-                 p["username"], p["password"], source),
+                 p["username"], p["password"], source,
+                 1 if source == "manual" else 0),
             )
             conn.commit()
             return cur.lastrowid
@@ -1339,49 +1358,59 @@ def add_proxy_db(endpoint: str, source: str = "manual") -> Optional[int]:
             conn.close()
 
 
-def add_proxies_batch(endpoints: list, source: str = "fetch") -> dict:
-    """Parse + dedupe + insert many proxies in ONE transaction."""
+def add_proxies_batch(endpoints: list, source: str = "fetch",
+                    limit: int = 0) -> dict:
+    """
+    Parse, dedupe in-memory, INSERT OR IGNORE in 500-row batches.
+    limit=0 means no cap (insert all valid).
+    DB UNIQUE(host,port) index handles cross-session deduplication —
+    the proxies table is NEVER loaded into Python memory.
+    """
+    log.info("ADD_PROXIES_BATCH start source=%s limit=%s", source, limit)
     parsed, valid, invalid = [], 0, 0
-    seen = set()
+    seen_local = set()
     for raw in endpoints:
         p = parse_proxy(raw)
         if not p:
             invalid += 1
             continue
         key = (p["host"], p["port"])
-        if key in seen:
+        if key in seen_local:
             continue
-        seen.add(key)
+        seen_local.add(key)
         parsed.append(p)
         valid += 1
+        if limit and len(parsed) >= limit:
+            break
+
+    BATCH_SIZE = 500
     inserted = duplicates = 0
+    precious = 1 if source == "manual" else 0
     with _db_lock:
         conn = get_conn()
         try:
-            existing = {
-                (r["host"], r["port"])
-                for r in conn.execute("SELECT host, port FROM proxies").fetchall()
-            }
-            rows = []
-            for p in parsed:
-                if (p["host"], p["port"]) in existing:
-                    duplicates += 1
-                    continue
-                rows.append((p["endpoint"], p["protocol"], p["host"], p["port"],
-                             p["username"], p["password"], source))
-                existing.add((p["host"], p["port"]))
-            if rows:
+            for i in range(0, len(parsed), BATCH_SIZE):
+                batch = parsed[i:i + BATCH_SIZE]
+                rows = [(p["endpoint"], p["protocol"], p["host"],
+                         p["port"], p["username"], p["password"], source,
+                         precious) for p in batch]
                 conn.executemany(
-                    """INSERT INTO proxies(endpoint, protocol, host, port, username, password, source)
-                       VALUES(?,?,?,?,?,?,?)""",
+                    """INSERT OR IGNORE INTO proxies
+                       (endpoint, protocol, host, port, username, password,
+                        source, is_precious)
+                       VALUES(?,?,?,?,?,?,?,?)""",
                     rows,
                 )
+                batch_inserted = conn.execute("SELECT changes()").fetchone()[0]
+                inserted += batch_inserted
+                duplicates += len(batch) - batch_inserted
                 conn.commit()
-            inserted = len(rows)
         finally:
             conn.close()
-    return {"valid": valid, "invalid": invalid, "duplicates": duplicates,
-            "inserted": inserted}
+    log.info("ADD_PROXIES_BATCH done valid=%s invalid=%s dupes=%s inserted=%s",
+             valid, invalid, duplicates, inserted)
+    return {"valid": valid, "invalid": invalid,
+            "duplicates": duplicates, "inserted": inserted}
 
 
 def get_proxy_row(proxy_id: int) -> Optional[dict]:
@@ -1394,31 +1423,39 @@ def get_proxy_row(proxy_id: int) -> Optional[dict]:
             conn.close()
 
 
-def list_proxies(limit: Optional[int] = 100, status_filter: Optional[str] = None,
-                 statuses: Optional[tuple] = None) -> list:
-    """List proxies. limit=None means NO cap — return every matching row."""
-    limit_sql = " LIMIT ?" if limit is not None else ""
+def list_proxies(limit: Optional[int] = 100,
+                 status_filter: Optional[str] = None,
+                 statuses: Optional[tuple] = None,
+                 source_filter: Optional[str] = None,
+                 offset: int = 0) -> list:
+    """
+    source_filter: 'manual' | 'fetch' | None (all)
+    offset: for streaming/pagination through large tables
+    """
+    conditions = []
+    params = []
+    if statuses:
+        ph = ",".join("?" * len(statuses))
+        conditions.append(f"health_status IN ({ph})")
+        params.extend(statuses)
+    elif status_filter:
+        conditions.append("health_status=?")
+        params.append(status_filter)
+    if source_filter:
+        conditions.append("source=?")
+        params.append(source_filter)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    limit_sql = f"LIMIT {int(limit)}" if limit is not None else ""
+    offset_sql = f"OFFSET {int(offset)}" if offset else ""
+
     with _db_lock:
         conn = get_conn()
         try:
-            if statuses:
-                ph = ",".join("?" * len(statuses))
-                params = tuple(statuses) + ((limit,) if limit is not None else ())
-                rows = conn.execute(
-                    f"SELECT * FROM proxies WHERE health_status IN ({ph}) ORDER BY id{limit_sql}",
-                    params,
-                ).fetchall()
-            elif status_filter:
-                params = (status_filter,) + ((limit,) if limit is not None else ())
-                rows = conn.execute(
-                    f"SELECT * FROM proxies WHERE health_status=? ORDER BY id{limit_sql}",
-                    params,
-                ).fetchall()
-            else:
-                params = (limit,) if limit is not None else ()
-                rows = conn.execute(
-                    f"SELECT * FROM proxies ORDER BY id{limit_sql}", params
-                ).fetchall()
+            rows = conn.execute(
+                f"SELECT * FROM proxies {where} ORDER BY id {limit_sql} {offset_sql}",
+                params,
+            ).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
@@ -1446,7 +1483,7 @@ def update_proxy_health(proxy_id: int, result: dict) -> None:
             score = _compute_score(status, succ, fail, latency)
             cooldown = None
             if not ok and consec_f > 0:
-                cd_secs = min(30 * (2 ** (consec_f - 1)), 600)
+                cd_secs = min(10 * consec_f, 180)
                 cooldown = (datetime.utcnow() + timedelta(seconds=cd_secs)).isoformat(
                     sep=" ", timespec="seconds")
             ip_verified = now if ip else row["last_ip_verified"]
@@ -1493,7 +1530,7 @@ def update_proxies_health_batch(results: list) -> None:
                 score = _compute_score(status, succ, fail, latency)
                 cooldown = None
                 if not ok and consec_f > 0:
-                    cd_secs = min(30 * (2 ** (consec_f - 1)), 600)
+                    cd_secs = min(10 * consec_f, 180)
                     cooldown = (datetime.utcnow() + timedelta(seconds=cd_secs)).isoformat(
                         sep=" ", timespec="seconds")
                 ip_verified = now if ip else row["last_ip_verified"]
@@ -1568,6 +1605,17 @@ def proxy_counts() -> dict:
             ).fetchone()
             tot = r["s"] + r["f"]
             d["success_rate"] = round((r["s"] / tot) * 100, 1) if tot else 0.0
+            ph = ",".join("?" * len(HEALTHY_STATUSES))
+            d["manual_total"] = conn.execute(
+                "SELECT COUNT(*) c FROM proxies WHERE source='manual'").fetchone()["c"]
+            d["fetch_total"] = conn.execute(
+                "SELECT COUNT(*) c FROM proxies WHERE source='fetch'").fetchone()["c"]
+            d["manual_working"] = conn.execute(
+                f"SELECT COUNT(*) c FROM proxies WHERE source='manual' "
+                f"AND health_status IN ({ph})", HEALTHY_STATUSES).fetchone()["c"]
+            d["fetch_working"] = conn.execute(
+                f"SELECT COUNT(*) c FROM proxies WHERE source='fetch' "
+                f"AND health_status IN ({ph})", HEALTHY_STATUSES).fetchone()["c"]
             return d
         finally:
             conn.close()
@@ -1588,27 +1636,33 @@ class ProxyPool:
         self._last_used: dict = {}   # proxy_id -> ts (in-memory, fast path)
         self._in_use: dict = {}      # proxy_id -> count currently leased
 
-    def healthy_proxies(self) -> list:
+    def healthy_proxies(self, source_filter: Optional[str] = None) -> list:
         with _db_lock:
             conn = get_conn()
             try:
                 ph = ",".join("?" * len(HEALTHY_STATUSES))
+                src_cond = "AND source=?" if source_filter else ""
+                params = [*HEALTHY_STATUSES,
+                          datetime.utcnow().isoformat(sep=" ", timespec="seconds")]
+                if source_filter:
+                    params.append(source_filter)
                 rows = conn.execute(
                     f"""SELECT * FROM proxies WHERE is_active=1
                        AND health_status IN ({ph})
-                       AND (cooldown_until IS NULL OR cooldown_until <= ?)""",
-                    (*HEALTHY_STATUSES,
-                     datetime.utcnow().isoformat(sep=" ", timespec="seconds")),
+                       AND (cooldown_until IS NULL OR cooldown_until <= ?)
+                       {src_cond}""",
+                    params,
                 ).fetchall()
                 return [dict(r) for r in rows]
             finally:
                 conn.close()
 
     def select(self, count: int = 1, exclude: Optional[set] = None,
-               exclude_subnet: Optional[str] = None) -> list:
+               exclude_subnet: Optional[str] = None,
+               source_filter: Optional[str] = None) -> list:
         """Lease up to `count` distinct healthy proxies (weighted, no immediate reuse)."""
         with self._lock:
-            avail = self.healthy_proxies()
+            avail = self.healthy_proxies(source_filter=source_filter)
             if exclude:
                 filtered = [r for r in avail if r["id"] not in exclude]
                 if filtered:
@@ -1706,74 +1760,109 @@ def _scope_statuses(scope: str) -> Optional[tuple]:
     return None
 
 
-def bulk_test_proxies(scope: str = "all", progress_cb=None,
+def bulk_test_proxies(scope: str = "all",
+                      limit: int = 0,           # 0 = unlimited
+                      source_filter: Optional[str] = None,
+                      progress_cb=None,
                       cancel_event: Optional[threading.Event] = None) -> dict:
-    """Test proxies by scope with bounded concurrency. Returns summary dict."""
-    rows = list_proxies(limit=None, statuses=_scope_statuses(scope))
-    if scope == "unhealthy":
-        # also include healthy-but-stale proxies
-        stale_cutoff = (datetime.utcnow() - timedelta(seconds=PROXY_RETEST_INTERVAL * 2)).isoformat(
-            sep=" ", timespec="seconds")
-        rows += [r for r in list_proxies(limit=None, statuses=HEALTHY_STATUSES)
-                 if (r["last_tested"] or "") < stale_cutoff]
-    if scope == "all":
-        rows = [r for r in rows if r["health_status"] != "WORKING" or True]
-    # de-dupe ids
-    seen_ids = set()
-    pending = []
-    for r in rows:
-        if r["id"] not in seen_ids:
-            seen_ids.add(r["id"])
-            pending.append(r)
+    """
+    Streams proxies in 500-row chunks to avoid OOM on large tables.
+    limit=0 means test everything that matches scope.
+    """
+    log.info("BULK_TEST start scope=%s limit=%s source=%s", scope, limit, source_filter)
+    BATCH_SIZE = 500
+    statuses = _scope_statuses(scope)
+
+    # Total count WITHOUT loading rows
+    with _db_lock:
+        conn = get_conn()
+        try:
+            conditions, params = [], []
+            if statuses:
+                ph = ",".join("?" * len(statuses))
+                conditions.append(f"health_status IN ({ph})")
+                params.extend(statuses)
+            if source_filter:
+                conditions.append("source=?")
+                params.append(source_filter)
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            total = conn.execute(
+                f"SELECT COUNT(*) c FROM proxies {where}", params
+            ).fetchone()["c"]
+        finally:
+            conn.close()
+
+    if limit:
+        total = min(total, limit)
 
     summary = {"tested": 0, "working": 0, "fast": 0, "slow": 0,
-               "failed": 0, "auth_failed": 0, "timeout": 0, "cancelled": False}
-    total = len(pending)
+               "failed": 0, "auth_failed": 0, "timeout": 0,
+               "cancelled": False, "total": total}
     if total == 0:
         return summary
 
     def _one(r):
-        p = {"protocol": r["protocol"], "host": r["host"], "port": r["port"],
-             "username": r["username"], "password": r["password"],
-             "endpoint": r["endpoint"]}
-        res = test_proxy(p)
-        return r["id"], res
+        p = {k: r[k] for k in ("protocol", "host", "port",
+                               "username", "password", "endpoint")}
+        return r["id"], test_proxy(p)
 
-    with ThreadPoolExecutor(max_workers=PROXY_TEST_CONCURRENCY) as ex:
-        futs = {ex.submit(_one, r): r for r in pending}
-        for fut in as_completed(futs):
-            if cancel_event and cancel_event.is_set():
-                summary["cancelled"] = True
-                for f in futs:
-                    f.cancel()
-                break
-            try:
-                pid, res = fut.result()
-            except Exception:
-                pid, res = futs[fut]["id"], {"status": "INVALID", "latency_ms": 0,
-                                             "exit_ip": "", "error": "test exception"}
-            update_proxy_health(pid, res)
-            st = res["status"]
-            summary["tested"] += 1
-            if st in ("WORKING", "CONNECTED"):
-                summary["working"] += 1
-            elif st == "FAST":
-                summary["fast"] += 1
-            elif st in ("SLOW", "VERY_SLOW"):
-                summary["slow"] += 1
-            elif st == "AUTH_FAILED":
-                summary["auth_failed"] += 1
-                summary["failed"] += 1
-            elif st == "TIMEOUT":
-                summary["timeout"] += 1
-                summary["failed"] += 1
-            else:
-                summary["failed"] += 1
-            if progress_cb:
+    offset = 0
+    while offset < total:
+        if cancel_event and cancel_event.is_set():
+            summary["cancelled"] = True
+            break
+        batch = list_proxies(limit=BATCH_SIZE, offset=offset,
+                             statuses=statuses, source_filter=source_filter)
+        if not batch:
+            break
+        results = []
+        with ThreadPoolExecutor(
+                max_workers=min(PROXY_TEST_CONCURRENCY, len(batch))) as ex:
+            futs = {ex.submit(_one, r): r for r in batch}
+            for fut in as_completed(futs):
+                if cancel_event and cancel_event.is_set():
+                    summary["cancelled"] = True
+                    break
                 try:
-                    progress_cb(summary["tested"], total, dict(summary))
+                    pid, res = fut.result()
                 except Exception:
-                    pass
+                    pid = futs[fut]["id"]
+                    res = {"status": "INVALID", "latency_ms": 0,
+                           "exit_ip": "", "error": "test exception"}
+                results.append((pid, res))
+                st = res["status"]
+                summary["tested"] += 1
+                if st == "FAST":
+                    summary["fast"] += 1
+                elif st in ("WORKING", "CONNECTED"):
+                    summary["working"] += 1
+                elif st in ("SLOW", "VERY_SLOW"):
+                    summary["slow"] += 1
+                elif st == "AUTH_FAILED":
+                    summary["auth_failed"] += 1
+                    summary["failed"] += 1
+                elif st == "TIMEOUT":
+                    summary["timeout"] += 1
+                    summary["failed"] += 1
+                else:
+                    summary["failed"] += 1
+                if progress_cb:
+                    try:
+                        progress_cb(summary["tested"], total, dict(summary))
+                    except Exception:
+                        pass
+
+        update_proxies_health_batch(results)
+        offset += BATCH_SIZE
+        if cancel_event and cancel_event.is_set():
+            summary["cancelled"] = True
+            break
+        if limit and summary["tested"] >= limit:
+            break
+
+    log.info("BULK_TEST done tested=%s working=%s fast=%s failed=%s cancelled=%s",
+             summary["tested"], summary["working"], summary["fast"],
+             summary["failed"], summary["cancelled"])
     return summary
 
 
@@ -1784,8 +1873,12 @@ def _auto_test_bulk_inserted(chat_id, admin_id, expected_count):
     rows_sorted = sorted(rows, key=lambda r: r["id"], reverse=True)[:expected_count]
     if not rows_sorted:
         return
+    log.info("AUTO_TEST start count=%s", len(rows_sorted))
     results = []
-    with ThreadPoolExecutor(max_workers=PROXY_TEST_CONCURRENCY) as ex:
+    # Cap auto-test concurrency at 12 — 48 simultaneous hits rate-limit the
+    # IP-check endpoints and falsely burn good proxies
+    auto_workers = min(12, PROXY_TEST_CONCURRENCY)
+    with ThreadPoolExecutor(max_workers=auto_workers) as ex:
         futs = {ex.submit(test_proxy, {
             "protocol": r["protocol"], "host": r["host"], "port": r["port"],
             "username": r["username"], "password": r["password"],
@@ -1800,8 +1893,10 @@ def _auto_test_bulk_inserted(chat_id, admin_id, expected_count):
                        "error": "test exception"}
             update_proxy_health(pid, res)
             results.append((pid, res))
+            time.sleep(0.05)   # spread load across IP-check endpoints
     working = sum(1 for _, r in results
                   if r["status"] in ("FAST", "WORKING", "CONNECTED", "SLOW", "VERY_SLOW"))
+    log.info("AUTO_TEST done tested=%s working=%s", len(results), working)
     safe_send_message(
         chat_id,
         (f"🧪 *AUTO-TEST COMPLETE*\n"
@@ -1811,9 +1906,6 @@ def _auto_test_bulk_inserted(chat_id, admin_id, expected_count):
          f"Dead: `{len(results) - working}`"))
 
 
-# =========================================================
-# Live Proxy Sources (fetch → parse → dedupe → store → test)
-# =========================================================
 def configured_proxy_sources() -> list:
     cfg = get_settings_batch(["proxy_source_1", "proxy_source_2", "proxy_source_3"])
     srcs = [cfg[k].strip() for k in ("proxy_source_1", "proxy_source_2", "proxy_source_3")
@@ -2628,7 +2720,8 @@ def _emit(st: dict, stage: str, **kw) -> None:
 # Extraction Worker (concurrent visits, cancellable)
 # =========================================================
 def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
-                      count: int, mode: str, msg_id: int) -> None:
+                      count: int, mode: str, msg_id: int,
+                      proxy_source_filter: Optional[str] = None) -> None:
     # --- atomic job registration: real job_id exists BEFORE job is cancellable
     job_id = create_job(user_id, username, url, mode, count)
     cancel_event = threading.Event()
@@ -2685,7 +2778,7 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
         status_code = 0
 
         if mode == "IP_ROTATION":
-            proxies = proxy_pool.select(count=1)
+            proxies = proxy_pool.select(count=1, source_filter=proxy_source_filter)
             _direct_fallback = False
             if not proxies and get_setting("fallback_direct_on_empty_pool", "0") == "1":
                 # Pool exhausted — attempt this visit direct (no proxy) so
@@ -2755,10 +2848,12 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                         status_code = 0
                         # proxy-layer failure → mark proxy; target failure → keep proxy
                         if _is_proxy_error(last_status):
+                            # Transient errors → TIMEOUT (short cooldown, back in
+                            # pool soon); only auth errors are sticky
+                            err_status = ("AUTH_FAILED" if last_status == "AUTH_FAILED"
+                                          else "TIMEOUT")
                             proxy_pool.mark_used_failure(
-                                proxy_row["id"],
-                                "AUTH_FAILED" if last_status == "AUTH_FAILED" else "TCP_FAILED",
-                                attempt_err)
+                                proxy_row["id"], err_status, attempt_err)
                         else:
                             update_proxy_health(proxy_row["id"],
                                                 {"status": "TARGET_FAILED", "latency_ms": 0,
@@ -2770,7 +2865,8 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                             break
                         # retry with a DIFFERENT fresh proxy — always, not just "safely"
                         if attempt < max_attempts - 1:
-                            nxt = proxy_pool.select(count=1, exclude=tried_ids)
+                            nxt = proxy_pool.select(count=1, exclude=tried_ids,
+                                                    source_filter=proxy_source_filter)
                             if nxt:
                                 proxy_row = nxt[0]
                                 proxy_dict = {k: proxy_row[k] for k in
@@ -2811,7 +2907,7 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
             for _ in range(3):
                 if cancel_event.is_set():
                     break
-                nxt = proxy_pool.select(count=1)
+                nxt = proxy_pool.select(count=1, source_filter=proxy_source_filter)
                 if not nxt:
                     break
                 nrow = nxt[0]
@@ -2833,7 +2929,7 @@ def extraction_worker(chat_id: int, user_id: int, username: str, url: str,
                     proxy_pool.release(nrow["id"])
                     return
                 except Exception:
-                    proxy_pool.mark_used_failure(nrow["id"], "TCP_FAILED",
+                    proxy_pool.mark_used_failure(nrow["id"], "TIMEOUT",
                                                  "block-rotate retry failed")
 
         # --- target-level permanent failures are NOT retried (404 etc.) ---
@@ -3687,28 +3783,41 @@ def admin_keyboard() -> types.InlineKeyboardMarkup:
 
 
 def proxy_center_keyboard() -> types.InlineKeyboardMarkup:
-    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk = types.InlineKeyboardMarkup(row_width=3)
     mk.add(
-        types.InlineKeyboardButton("📡 Fetch Latest", callback_data="px_fetch"),
-        types.InlineKeyboardButton("⚡ Fetch + Test", callback_data="px_fetch_test"),
-        types.InlineKeyboardButton("➕ Add Proxy", callback_data="px_add"),
-        types.InlineKeyboardButton("📦 Bulk Add", callback_data="px_bulk"),
-        types.InlineKeyboardButton("📋 Working Only", callback_data="px_working"),
         types.InlineKeyboardButton("🧪 Test All", callback_data="px_test_all"),
         types.InlineKeyboardButton("🔄 Retest Unhealthy", callback_data="px_retest"),
-        types.InlineKeyboardButton("🗑 Delete Dead", callback_data="px_cleanup"),
-        types.InlineKeyboardButton("🗑 Delete Failed", callback_data="px_del_failed"),
-        types.InlineKeyboardButton("📋 List", callback_data="px_list"),
+    )
+    mk.add(
+        types.InlineKeyboardButton("🔧 Test Manual", callback_data="px_test_manual"),
+        types.InlineKeyboardButton("🌍 Test Fetched", callback_data="px_test_fetch"),
+    )
+    mk.add(
+        types.InlineKeyboardButton("📡 Fetch Latest", callback_data="px_fetch"),
+        types.InlineKeyboardButton("📡 Fetch + Test", callback_data="px_fetch_test"),
+    )
+    mk.add(
+        types.InlineKeyboardButton("➕ Add Proxy", callback_data="px_add"),
+        types.InlineKeyboardButton("📦 Bulk Add", callback_data="px_bulk"),
+        types.InlineKeyboardButton("📋 Proxy List", callback_data="px_list"),
+        types.InlineKeyboardButton("✅ Working", callback_data="px_working"),
+    )
+    mk.add(
         types.InlineKeyboardButton("🔌 Sources", callback_data="px_sources"),
-        types.InlineKeyboardButton("📊 Stats", callback_data="px_dashboard"),
+        types.InlineKeyboardButton("🗑 Clean Dead", callback_data="px_cleanup"),
+        types.InlineKeyboardButton("🗑 Del Failed", callback_data="px_del_failed"),
+    )
+    mk.add(
+        types.InlineKeyboardButton("🗑 Del Fetched", callback_data="px_del_fetched"),
+        types.InlineKeyboardButton("💣 Delete ALL", callback_data="px_nuke_confirm"),
+    )
+    mk.add(
+        types.InlineKeyboardButton("📊 Dashboard", callback_data="px_dashboard"),
         types.InlineKeyboardButton("🔙 Admin", callback_data="adm_panel"),
     )
     return mk
 
 
-# =========================================================
-# URL Validation (broad public HTTP/HTTPS support)
-# =========================================================
 _URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
 _HOST_RE = re.compile(
     r"^(localhost|\d{1,3}(\.\d{1,3}){3}|[a-z0-9]([a-z0-9\-]*[a-z0-9])?"
@@ -3928,7 +4037,7 @@ def cmd_cancel(message: types.Message):
 # =========================================================
 # Job starter
 # =========================================================
-def _start_job(chat_id, user, url, mode, visits):
+def _start_job(chat_id, user, url, mode, visits, proxy_source_filter=None):
     msg = safe_send_message(
         chat_id,
         ("⚡ *EXTRACTION ENGINE*\n"
@@ -3941,7 +4050,8 @@ def _start_job(chat_id, user, url, mode, visits):
         return
     threading.Thread(
         target=extraction_worker,
-        args=(chat_id, user.id, user.username, url, visits, mode, msg.message_id),
+        args=(chat_id, user.id, user.username, url, visits, mode, msg.message_id,
+              proxy_source_filter),
         daemon=True,
     ).start()
 
@@ -4337,14 +4447,88 @@ def on_callback(c: types.CallbackQuery):
                 safe_answer_callback(c.id, "Proxy mode disabled by admin.",
                                      show_alert=True)
                 return
-            mode = "DIRECT" if data == "mode_direct" else "IP_ROTATION"
+            if data == "mode_proxy":
+                # Insert proxy-source selection step before visit count
+                mode = "IP_ROTATION"
+                set_user_state(u.id, "extract_proxy_source",
+                               data={"url": url, "mode": mode}, push=True)
+                safe_answer_callback(c.id)
+                pc = proxy_counts()
+                manual_h = pc.get("manual_working", 0)
+                fetch_h = pc.get("fetch_working", 0)
+                all_h = pc.get("fast", 0) + pc.get("working", 0)
+                mk = types.InlineKeyboardMarkup(row_width=1)
+                mk.add(
+                    types.InlineKeyboardButton(
+                        f"🔧 Manual Proxies Only  ({manual_h} healthy)",
+                        callback_data="ipsrc_manual"),
+                    types.InlineKeyboardButton(
+                        f"🌍 Fetched Proxies Only  ({fetch_h} healthy)",
+                        callback_data="ipsrc_fetch"),
+                    types.InlineKeyboardButton(
+                        f"🔀 All Proxies  ({all_h} healthy)",
+                        callback_data="ipsrc_all"),
+                )
+                mk.add(types.InlineKeyboardButton("🔙 Back", callback_data="nav_back"))
+                safe_edit_message(
+                    chat_id, msg_id,
+                    ("🔄 *PROXY SOURCE*\n"
+                     "━━━━━━━━━━━━━━━━━━━━\n"
+                     "Which proxy pool should power this job?\n\n"
+                     "🔧 *Manual* — your paid/configured proxies\n"
+                     "🌍 *Fetched* — GitHub-scraped free proxies\n"
+                     "🔀 *All* — best available from either pool"),
+                    reply_markup=mk)
+                return
+            mode = "DIRECT"
             set_user_state(u.id, "extract_visits", data={"url": url, "mode": mode})
             safe_answer_callback(c.id)
             mx = int(get_setting("max_visits", str(MAX_VISITS_PER_JOB)))
-            mode_lbl = "🌐 IP Rotation" if mode == "IP_ROTATION" else "🟢 Direct"
             safe_edit_message(
                 chat_id, msg_id,
-                f"⚙️ *{mode_lbl}* selected.\nChoose visit count:",
+                f"⚙️ *🟢 Direct* selected.\nChoose visit count:",
+                reply_markup=visits_keyboard(mx))
+            return
+
+        # ---------- proxy source selection (IP rotation flow) ----------
+        if data in ("ipsrc_manual", "ipsrc_fetch", "ipsrc_all"):
+            safe_answer_callback(c.id)
+            st = get_user_state(u.id)
+            d = st.get("data", {})
+            url, mode = d.get("url"), d.get("mode", "IP_ROTATION")
+            if not url:
+                safe_answer_callback(c.id, "⚠️ Session expired.", show_alert=True)
+                return
+            src_map = {"ipsrc_manual": "manual", "ipsrc_fetch": "fetch",
+                       "ipsrc_all": None}
+            source_filter = src_map[data]
+            pc = proxy_counts()
+            healthy = (pc.get("manual_working", 0) if source_filter == "manual"
+                       else pc.get("fetch_working", 0) if source_filter == "fetch"
+                       else pc.get("fast", 0) + pc.get("working", 0))
+            if healthy == 0:
+                src_label = {"manual": "Manual", "fetch": "Fetched"}.get(
+                    source_filter, "All")
+                mk2 = types.InlineKeyboardMarkup(row_width=1)
+                mk2.add(
+                    types.InlineKeyboardButton("🔀 Use All Proxies Instead",
+                                               callback_data="ipsrc_all"),
+                    types.InlineKeyboardButton("🔙 Back", callback_data="nav_back"))
+                safe_edit_message(
+                    chat_id, msg_id,
+                    (f"⚠️ *No healthy {src_label} proxies.*\n\n"
+                     f"Run a proxy test first, or choose a different source."),
+                    reply_markup=mk2)
+                return
+            set_user_state(u.id, "extract_visits",
+                           data={"url": url, "mode": mode,
+                                 "proxy_source_filter": source_filter})
+            mx = int(get_setting("max_visits", str(MAX_VISITS_PER_JOB)))
+            src_lbl = {"manual": "🔧 Manual", "fetch": "🌍 Fetched"}.get(
+                source_filter, "🔀 All")
+            safe_edit_message(
+                chat_id, msg_id,
+                f"✅ *{src_lbl}* pool selected.\nChoose visit count:",
                 reply_markup=visits_keyboard(mx))
             return
 
@@ -4366,7 +4550,8 @@ def on_callback(c: types.CallbackQuery):
             safe_answer_callback(c.id)
             safe_edit_message(chat_id, msg_id,
                               f"🚀 *Starting {n} visit(s)…*")
-            _start_job(chat_id, u, url, mode, n)
+            _start_job(chat_id, u, url, mode, n,
+                       proxy_source_filter=d.get("proxy_source_filter"))
             return
 
         # ---------- user job detail ----------
@@ -4495,8 +4680,83 @@ def on_callback(c: types.CallbackQuery):
             _show_proxy_list(chat_id, working_only=True)
             return
         if data == "px_test_all":
-            safe_answer_callback(c.id, "Test started…")
-            _start_proxy_test(chat_id, u.id, scope="all")
+            safe_answer_callback(c.id)
+            mk2 = types.InlineKeyboardMarkup(row_width=3)
+            mk2.add(
+                types.InlineKeyboardButton("1,000",  callback_data="px_testN_1000"),
+                types.InlineKeyboardButton("5,000",  callback_data="px_testN_5000"),
+                types.InlineKeyboardButton("10,000", callback_data="px_testN_10000"),
+                types.InlineKeyboardButton("20,000", callback_data="px_testN_20000"),
+                types.InlineKeyboardButton("All",    callback_data="px_testN_0"),
+            )
+            mk2.add(types.InlineKeyboardButton("🔙 Back", callback_data="adm_proxies"))
+            safe_send_message(chat_id,
+                "🧪 *TEST PROXIES*\n━━━━━━━━━━━━━━━━━━━━\n"
+                "How many proxies to test?",
+                reply_markup=mk2)
+            return
+        if data.startswith("px_testN_"):
+            n = int(data.split("_")[2])
+            safe_answer_callback(c.id, f"Testing up to {n or 'all'} proxies…")
+            _start_proxy_test(chat_id, u.id, scope="all", limit=n)
+            return
+        if data == "px_test_manual":
+            safe_answer_callback(c.id, "Testing manual proxies…")
+            _start_proxy_test(chat_id, u.id, scope="all", source_filter="manual")
+            return
+        if data == "px_test_fetch":
+            safe_answer_callback(c.id, "Testing fetched proxies…")
+            _start_proxy_test(chat_id, u.id, scope="all", source_filter="fetch")
+            return
+        if data == "px_del_fetched":
+            with _db_lock:
+                conn = get_conn()
+                try:
+                    conn.execute("DELETE FROM proxies WHERE source='fetch'")
+                    n = conn.execute("SELECT changes()").fetchone()[0]
+                    conn.commit()
+                finally:
+                    conn.close()
+            audit_log(u.id, "PROXY_DEL_FETCHED", f"deleted {n}")
+            safe_answer_callback(c.id, f"Deleted {n} fetched proxies.")
+            safe_send_message(chat_id,
+                f"🗑 Deleted `{n}` fetched proxies. Manual proxies kept.",
+                reply_markup=proxy_center_keyboard())
+            return
+        if data == "px_nuke_confirm":
+            safe_answer_callback(c.id)
+            pc = proxy_counts()
+            mk2 = types.InlineKeyboardMarkup(row_width=2)
+            mk2.add(
+                types.InlineKeyboardButton("✅ YES — Delete All",
+                                           callback_data="px_nuke_execute"),
+                types.InlineKeyboardButton("❌ Cancel",
+                                           callback_data="adm_proxies"))
+            safe_send_message(
+                chat_id,
+                (f"⚠️ *DANGER ZONE*\n"
+                 f"━━━━━━━━━━━━━━━━━━━━\n"
+                 f"This will permanently delete ALL `{pc['total']}` proxies.\n"
+                 f"🔧 Manual: `{pc.get('manual_total', 0)}`\n"
+                 f"🌍 Fetched: `{pc.get('fetch_total', 0)}`\n\n"
+                 f"Are you absolutely sure?"),
+                reply_markup=mk2)
+            return
+        if data == "px_nuke_execute":
+            safe_answer_callback(c.id)
+            with _db_lock:
+                conn = get_conn()
+                try:
+                    n = conn.execute("SELECT COUNT(*) c FROM proxies").fetchone()["c"]
+                    conn.execute("DELETE FROM proxies")
+                    conn.commit()
+                finally:
+                    conn.close()
+            audit_log(u.id, "PROXY_NUKE", f"deleted {n} proxies")
+            safe_send_message(
+                chat_id,
+                f"💣 *ALL {n} proxies deleted.*\nProxy pool is now empty.",
+                reply_markup=proxy_center_keyboard())
             return
         if data == "px_retest":
             safe_answer_callback(c.id, "Retesting unhealthy…")
@@ -4554,8 +4814,25 @@ def on_callback(c: types.CallbackQuery):
                 reply_markup=nav_markup())
             return
         if data == "px_fetch":
-            safe_answer_callback(c.id, "Fetching…")
-            _start_proxy_fetch(chat_id, u.id, test_after=False)
+            safe_answer_callback(c.id)
+            mk2 = types.InlineKeyboardMarkup(row_width=3)
+            mk2.add(
+                types.InlineKeyboardButton("5,000",  callback_data="px_fetch_5000"),
+                types.InlineKeyboardButton("10,000", callback_data="px_fetch_10000"),
+                types.InlineKeyboardButton("20,000", callback_data="px_fetch_20000"),
+                types.InlineKeyboardButton("50,000", callback_data="px_fetch_50000"),
+                types.InlineKeyboardButton("All",    callback_data="px_fetch_0"),
+            )
+            mk2.add(types.InlineKeyboardButton("🔙 Back", callback_data="adm_proxies"))
+            safe_send_message(chat_id,
+                "📡 *FETCH PROXIES*\n━━━━━━━━━━━━━━━━━━━━\n"
+                "How many proxies to fetch and store?",
+                reply_markup=mk2)
+            return
+        if data.startswith("px_fetch_") and data.split("_")[2].isdigit():
+            n = int(data.split("_")[2])
+            safe_answer_callback(c.id, f"Fetching up to {n or 'all'} proxies…")
+            _start_proxy_fetch(chat_id, u.id, test_after=False, fetch_limit=n)
             return
         if data == "px_fetch_test":
             safe_answer_callback(c.id, "Fetching + testing…")
@@ -5038,21 +5315,19 @@ def _show_proxy_center(chat_id):
     last_line = ""
     if last:
         last_line = (f"\n📡 Last fetch: `{(last['created_at'] or '')[:16]}`\n"
-                     f"Source: `{_mask(last['source'])[:40]}`\n"
-                     f"Fetched: `{last['fetched']}` · Valid: `{last['valid']}` · "
-                     f"Dupes: `{last['duplicates']}`\n")
+                     f"   Inserted: `{last['fetched']}` · Dupes: `{last['duplicates']}`\n")
     safe_send_message(
         chat_id,
         (f"🌐 *PROXY CONTROL CENTER*\n"
          f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"📊 Total: `{pc['total']}`\n\n"
-         f"🟢 Fast: `{pc['fast']}`\n"
-         f"🟢 Working: `{pc['working']}`\n"
-         f"🟡 Slow: `{pc['slow']}`\n"
-         f"🔴 Dead: `{pc['dead']}`\n"
+         f"📊 Total: `{pc['total']}`\n"
+         f"  🔧 Manual: `{pc.get('manual_total', 0)}`  ({pc.get('manual_working', 0)} healthy)\n"
+         f"  🌍 Fetched: `{pc.get('fetch_total', 0)}`  ({pc.get('fetch_working', 0)} healthy)\n\n"
+         f"🟢 Fast: `{pc['fast']}`   🟢 Working: `{pc['working']}`\n"
+         f"🟡 Slow: `{pc['slow']}`   🔴 Dead: `{pc['dead']}`\n"
          f"⚪ Untested: `{pc['untested']}`\n\n"
          f"⚡ Avg Latency: `{pc['avg_latency']} ms`\n"
-         f"📈 Success Rate: `{pc['success_rate']}%`\n"
+         f"📈 Success Rate: `{pc['success_rate']}% `\n"
          f"{last_line}"
          f"━━━━━━━━━━━━━━━━━━━━\n"
          f"SOCKS5: `{'✅' if _SOCKS_OK else '❌ install PySocks'}`"),
@@ -5081,6 +5356,8 @@ def _show_proxy_list(chat_id, working_only=False):
              "TCP_FAILED": "🔴", "INVALID": "⚫", "UNTESTED": "⚪"}
     for r in rows:
         ic = icons.get(r["health_status"], "⚪")
+        if r.get("source") == "manual" or r.get("is_precious"):
+            ic = "🔧" + ic   # manual/precious proxies are marked
         # credentials are NEVER shown — host:port only
         lines.append(
             f"{ic} `#{r['id']}` *{r['protocol'].upper()}* "
@@ -5173,19 +5450,31 @@ def _handle_proxy_bulk(chat_id, admin_id, text):
 
 
 def _cleanup_dead_proxies(chat_id, admin_id):
+    log.info("CLEANUP_DEAD start admin=%s", admin_id)
     with _db_lock:
         conn = get_conn()
         try:
+            # Protect manual proxies (require 15 consecutive fails) and
+            # never touch is_precious rows
             cur = conn.execute(
-                "DELETE FROM proxies WHERE health_status IN "
-                "('TCP_FAILED','AUTH_FAILED','INVALID') AND consecutive_failures >= 5")
+                """DELETE FROM proxies
+                   WHERE health_status IN ('TCP_FAILED','AUTH_FAILED','INVALID')
+                   AND is_precious=0
+                   AND (
+                       (source != 'manual' AND consecutive_failures >= 5)
+                       OR (source = 'manual' AND consecutive_failures >= 15)
+                   )""")
             n = cur.rowcount
             conn.commit()
         finally:
             conn.close()
     audit_log(admin_id, "PROXY_CLEANUP", f"removed {n}")
-    safe_send_message(chat_id, f"🗑 Removed `{n}` dead proxies.",
-                      reply_markup=proxy_center_keyboard())
+    log.info("CLEANUP_DEAD done removed=%s", n)
+    safe_send_message(
+        chat_id,
+        f"🗑 Removed `{n}` dead proxies.\n"
+        f"_(Manual proxies need 15+ consecutive fails; precious proxies are never deleted)_",
+        reply_markup=proxy_center_keyboard())
 
 
 def _show_proxy_sources(chat_id, edit_msg=False):
@@ -5207,27 +5496,33 @@ def _show_proxy_sources(chat_id, edit_msg=False):
 # =========================================================
 # Proxy bulk-test worker (scope-aware, cancellable, live progress)
 # =========================================================
-def _start_proxy_test(chat_id, admin_id, scope="all"):
+def _start_proxy_test(chat_id, admin_id, scope="all",
+                      limit=0, source_filter=None):
     if proxy_test_jobs.get(admin_id) and not proxy_test_jobs[admin_id].is_set():
         safe_send_message(chat_id, "⚠️ A proxy test is already running.")
         return
     cancel_ev = threading.Event()
     proxy_test_jobs[admin_id] = cancel_ev
     threading.Thread(target=_proxy_test_worker,
-                     args=(chat_id, admin_id, scope, cancel_ev),
+                     args=(chat_id, admin_id, scope, cancel_ev, limit, source_filter),
                      daemon=True).start()
 
 
-def _proxy_test_worker(chat_id, admin_id, scope, cancel_ev):
-    log.info("PROXY_TEST_START admin=%s scope=%s", admin_id, scope)
+def _proxy_test_worker(chat_id, admin_id, scope, cancel_ev,
+                     limit=0, source_filter=None):
+    log.info("PROXY_TEST_START admin=%s scope=%s limit=%s source=%s",
+             admin_id, scope, limit, source_filter)
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("🛑 Cancel Test",
                                       callback_data="px_test_cancel"))
     scope_lbl = {"all": "ALL", "unhealthy": "UNHEALTHY", "untested": "UNTESTED",
                  "working": "WORKING"}.get(scope, scope.upper())
+    src_lbl = {"manual": " — 🔧 Manual", "fetch": " — 🌍 Fetched"}.get(
+        source_filter, "")
+    header = f"🧪 *PROXY CHECKING ({scope_lbl}{src_lbl})*"
     msg = safe_send_message(
         chat_id,
-        (f"🧪 *PROXY CHECKING ({scope_lbl})*\n"
+        (header + "\n"
          f"━━━━━━━━━━━━━━━━━━━━\n`0%`"),
         reply_markup=mk)
     if not msg:
@@ -5244,7 +5539,7 @@ def _proxy_test_worker(chat_id, admin_id, scope, cancel_ev):
         bar = "█" * done + "░" * (10 - done)
         safe_edit_message(
             chat_id, msg.message_id,
-            (f"🧪 *PROXY CHECKING ({scope_lbl})*\n"
+            (header + "\n"
              f"━━━━━━━━━━━━━━━━━━━━\n"
              f"`[{bar}] {pct}%`\n"
              f"Tested: `{tested}/{total}`\n"
@@ -5255,18 +5550,21 @@ def _proxy_test_worker(chat_id, admin_id, scope, cancel_ev):
              f"🔐 Auth: `{s['auth_failed']}` · ⏱ Timeout: `{s['timeout']}`"),
             reply_markup=mk)
 
-    result = bulk_test_proxies(scope=scope, progress_cb=cb, cancel_event=cancel_ev)
+    result = bulk_test_proxies(scope=scope, limit=limit,
+                               source_filter=source_filter,
+                               progress_cb=cb, cancel_event=cancel_ev)
     proxy_test_jobs.pop(admin_id, None)
-    log.info("PROXY_TEST_COMPLETE scope=%s tested=%s", scope, result["tested"])
+    log.info("PROXY_TEST_COMPLETE scope=%s source=%s tested=%s",
+             scope, source_filter, result["tested"])
     if result["tested"] == 0 and not result["cancelled"]:
         safe_edit_message(chat_id, msg.message_id,
-                          f"✅ No proxies match scope *{scope_lbl}*.")
+                          f"✅ No proxies match scope *{scope_lbl}{src_lbl}*.")
         return
     safe_edit_message(
         chat_id, msg.message_id,
         (f"{'🛑 *Test cancelled*' if result['cancelled'] else '✅ *Proxy test complete*'}\n"
          f"━━━━━━━━━━━━━━━━━━━━\n"
-         f"Scope: `{scope_lbl}`\n"
+         f"Scope: `{scope_lbl}{src_lbl}`\n"
          f"Tested: `{result['tested']}`\n"
          f"🟢 Fast: `{result['fast']}`\n"
          f"🟢 Working: `{result['working']}`\n"
@@ -5278,10 +5576,9 @@ def _proxy_test_worker(chat_id, admin_id, scope, cancel_ev):
                       reply_markup=proxy_center_keyboard())
 
 
-# =========================================================
-# Live proxy fetch worker (fetch → parse → dedupe → store → test)
-# =========================================================
-def _start_proxy_fetch(chat_id, admin_id, test_after=False):
+def _start_proxy_fetch(chat_id, admin_id, test_after=False,
+                       fetch_limit=0):   # 0 = no limit
+    """fetch_limit: max proxies to insert (0 = all)"""
     if proxy_fetch_jobs.get(admin_id) and not proxy_fetch_jobs[admin_id].is_set():
         safe_send_message(chat_id, "⚠️ A proxy fetch is already running.")
         return
@@ -5296,12 +5593,13 @@ def _start_proxy_fetch(chat_id, admin_id, test_after=False):
     cancel_ev = threading.Event()
     proxy_fetch_jobs[admin_id] = cancel_ev
     threading.Thread(target=_proxy_fetch_worker,
-                     args=(chat_id, admin_id, test_after, cancel_ev),
+                     args=(chat_id, admin_id, test_after, cancel_ev, fetch_limit),
                      daemon=True).start()
 
 
-def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev):
-    log.info("PROXY_FETCH_START admin=%s test_after=%s", admin_id, test_after)
+def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev, fetch_limit=0):
+    log.info("PROXY_FETCH_START admin=%s test_after=%s limit=%s",
+             admin_id, test_after, fetch_limit)
     mk = types.InlineKeyboardMarkup()
     mk.add(types.InlineKeyboardButton("🛑 Cancel", callback_data="px_fetch_cancel"))
     msg = safe_send_message(
@@ -5350,7 +5648,7 @@ def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev):
          f"Parsing · normalizing · deduplicating…"),
         reply_markup=mk)
 
-    stats = add_proxies_batch(all_raw, source="fetch")
+    stats = add_proxies_batch(all_raw, source="fetch", limit=fetch_limit)
     audit_log(admin_id, "PROXY_FETCH",
               f"fetched={total_fetched} inserted={stats['inserted']}")
 
@@ -5408,7 +5706,9 @@ def _proxy_fetch_worker(chat_id, admin_id, test_after, cancel_ev):
              f"🔴 Dead: `{s['failed']}`"),
             reply_markup=mk)
 
-    result = bulk_test_proxies(scope="untested", progress_cb=cb,
+    result = bulk_test_proxies(scope="untested",
+                               limit=fetch_limit if fetch_limit else 0,
+                               progress_cb=cb,
                                cancel_event=cancel_ev)
     summary["working"] = result["working"] + result["fast"]
     summary["slow"] = result["slow"]
@@ -5776,27 +6076,38 @@ def _run_diagnostics(chat_id):
 # Delete Failed Proxies (not Dead/TCP_FAILED, but FAILED status from job)
 # =========================================================
 def _cleanup_failed_proxies(chat_id, admin_id):
-    """Delete proxies that have repeatedly failed (high consecutive_failures)."""
+    """Delete only CONFIRMED dead proxies — never after a single failure."""
+    log.info("CLEANUP_FAILED start admin=%s", admin_id)
     with _db_lock:
         conn = get_conn()
         try:
-            # Failed = AUTH_FAILED, TCP_FAILED, INVALID with any consecutive failures
+            # 5+ consecutive failures for fetched, 10+ for manual,
+            # is_precious rows are never auto-deleted
             cur = conn.execute(
-                """DELETE FROM proxies WHERE health_status IN
-                   ('AUTH_FAILED','TCP_FAILED','INVALID','TIMEOUT')
-                   AND consecutive_failures >= 1""")
+                """DELETE FROM proxies
+                   WHERE is_precious=0
+                   AND (
+                       (source != 'manual' AND health_status IN
+                        ('AUTH_FAILED','TCP_FAILED','INVALID','TIMEOUT')
+                        AND consecutive_failures >= 5)
+                       OR
+                       (source = 'manual' AND health_status IN
+                        ('AUTH_FAILED','TCP_FAILED','INVALID','TIMEOUT')
+                        AND consecutive_failures >= 10)
+                   )""")
             n = cur.rowcount
             conn.commit()
         finally:
             conn.close()
     audit_log(admin_id, "PROXY_FAILED_CLEANUP", f"removed {n}")
-    safe_send_message(chat_id, f"🗑 Removed `{n}` failed proxies (AUTH/TCP/Invalid/Timeout).",
-                      reply_markup=proxy_center_keyboard())
+    log.info("CLEANUP_FAILED done removed=%s", n)
+    safe_send_message(
+        chat_id,
+        f"🗑 Removed `{n}` confirmed-dead proxies.\n"
+        f"_(Threshold: 5+ fails for fetched, 10+ for manual)_",
+        reply_markup=proxy_center_keyboard())
 
 
-# =========================================================
-# Bot Access Permission — Allowed Users Panel
-# =========================================================
 def _show_allowed_users(chat_id, admin_id):
     users = list_allowed_users(limit=30)
     lines = [
@@ -5854,20 +6165,38 @@ def _handle_grant_access_search(chat_id, admin_id, query):
 # =========================================================
 # Background proxy auto-retest (configurable, bounded, gentle)
 # =========================================================
+_retest_lock = threading.Lock()
+
+
 def _retest_loop():
     while True:
         interval = int(get_setting("proxy_retest_interval",
                                    str(PROXY_RETEST_INTERVAL)))
         time.sleep(max(60, interval))
+
+        # Skip if any manual bulk test is active — never double concurrency
+        if any(not ev.is_set() for ev in proxy_test_jobs.values()):
+            log.info("RETEST_LOOP skipped — manual test running")
+            continue
+
+        # Only one background retest at a time
+        if not _retest_lock.acquire(blocking=False):
+            continue
         try:
             batch = int(get_setting("proxy_retest_batch", str(PROXY_RETEST_BATCH)))
-            rows = list_proxies(limit=batch, status_filter="UNTESTED")
-            rows += list_proxies(limit=batch, statuses=("TCP_FAILED", "TIMEOUT"))
-            # stale healthy proxies (not retested for 2× interval)
+            # Priority: UNTESTED → failed/timeout → stale healthy
+            rows = list_proxies(limit=batch, statuses=("UNTESTED",))
+            if len(rows) < batch:
+                rows += list_proxies(limit=batch - len(rows),
+                                     statuses=("TCP_FAILED", "TIMEOUT"))
             stale_cutoff = (datetime.utcnow() - timedelta(
                 seconds=interval * 2)).isoformat(sep=" ", timespec="seconds")
-            rows += [r for r in list_proxies(limit=batch, statuses=HEALTHY_STATUSES)
-                     if (r["last_tested"] or "") < stale_cutoff]
+            if len(rows) < batch:
+                stale = [r for r in list_proxies(
+                    limit=batch, statuses=HEALTHY_STATUSES)
+                         if (r["last_tested"] or "") < stale_cutoff]
+                rows += stale[:batch - len(rows)]
+
             seen, pending = set(), []
             for r in rows:
                 if r["id"] not in seen:
@@ -5876,15 +6205,17 @@ def _retest_loop():
             pending = pending[:batch]
             if not pending:
                 continue
+
             log.info("RETEST_LOOP testing %d proxies", len(pending))
 
             def _one(r):
-                p = {k: r[k] for k in ("protocol", "host", "port", "username",
-                                       "password", "endpoint")}
+                p = {k: r[k] for k in ("protocol", "host", "port",
+                                       "username", "password", "endpoint")}
                 return r["id"], test_proxy(p)
 
             results = []
-            with ThreadPoolExecutor(max_workers=min(8, PROXY_TEST_CONCURRENCY)) as ex:
+            # Max 4 workers — never compete with main polling
+            with ThreadPoolExecutor(max_workers=4) as ex:
                 for fut in as_completed([ex.submit(_one, r) for r in pending]):
                     try:
                         results.append(fut.result())
@@ -5893,11 +6224,10 @@ def _retest_loop():
             update_proxies_health_batch(results)
         except Exception as e:
             log.warning("retest loop error: %s", _mask(str(e)[:150]))
+        finally:
+            _retest_lock.release()
 
 
-# =========================================================
-# Startup
-# =========================================================
 def startup_self_check():
     log.info("Bot starting…")
     checks = []
